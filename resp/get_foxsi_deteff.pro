@@ -9,8 +9,7 @@ FUNCTION get_foxsi_deteff, ENERGY_ARR = energy_arr, DET_THICK = det_thick, PLOT 
 ; WRITTEN: Steven Christe (23-Mar-09)
 ; UPDATED L.G. Sept. 2012
 
-default, data_dir, 'calibration_data/'
-default, let_file, 'efficiency_averaged.sav'
+default, data_dir, './'
 default, type, 'si'
 
 if not keyword_set(no_let) and not keyword_set(let_file) then begin

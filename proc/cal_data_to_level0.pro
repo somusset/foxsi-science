@@ -250,19 +250,23 @@ end
 ; History:	Version 1, 2013-May-09, Lindsay Glesener
 ;
 
-FUNCTION	USB_DATA_TO_LEVEL0, FILENAME, DETECTOR=DETECTOR, STOP=STOP
+FUNCTION	FORMATTER_DATA_TO_LEVEL0, FILENAME, DETECTOR=DETECTOR, STOP=STOP
 
 	add_path, 'util/'
-	
-	; This starts from the data structure that has been produced by
-	; read_data_struct_cal_c.  Result of that function should be stored in
-	; file.  Read that file into this function.
-	
-	; input DETECTOR=# to tell the routine which detector it is.
-	; (This info is not found in the data file.
-	
-	restore, filename
-	nFrames = n_elements(data)
+
+	frame_length = 256
+
+	; Read in data file.
+	openr, lun, filename, /get_lun
+	frame = read_binary(lun, data_dims=-1, data_type=2)		; read in integers
+	frame = uint(frame)  						; cast to unsigned
+	nFrames = n_elements(frame)/frame_length
+	frame = reform(frame,[frame_length,nFrames])		; reshape into a frame-by-frame array.
+	close, lun							; no longer need the file.
+
+	; The next section pulls the detector data into a structure and 
+	; is a little similar to the earlier FOXSI calibration
+	; processing codes (specifically formatter_packet_b.pro)
 
   	; prepare the data structure and make an array with one element for each frame.
   	print, '  Creating data structure.'
@@ -289,51 +293,123 @@ FUNCTION	USB_DATA_TO_LEVEL0, FILENAME, DETECTOR=DETECTOR, STOP=STOP
     data_struct = replicate(data_struct, nFrames)
 
     print, '  Filling in header info.'
-    data_struct.frame_counter = data.frame_counter[0]
-    data_struct.frame_time = 0.
+    data_struct.frame_counter = reform( ishft( ulong(frame[4,*]),16 ) + frame[5,*] )
+    data_struct.frame_time = reform( ishft( ulong64(frame[1,*]),32 ) + ishft( ulong64(frame[2,*]),16 ) + frame[3,*] )
     data_struct.det_num = detector
-    data_struct.trigger_time = data.time[0]
-    data_struct.HV = ishft(200*8, 4)	; set HV to 200, in McB's encoded way.
-    data_struct.inflight = 1
-    data_struct.common_mode = data.cmn_median
+    data_struct.trigger_time = reform( frame[23 + 33*detector, *] )
+    
+    ; HV data
+    data_struct.HV = reform( frame[13,*] )
+
+
+	; temporary arrays to grab data during loops
+	adc_array = uintarr(4,3,nFrames)
+	strip_array = uintarr(4,3,nFrames)
 
 	print, '  Filling in ADC values.'
-	
-	; temporary values
-	hit_strip = intarr(4, nFrames)
-	hit_adc = intarr(4, nFrames)
+    	for i=0, 3 do begin
+       		print, '    ASIC ', i
+          	index = 28 + 33*detector + 8*i + [0,1,2]
+          	strip = ishft(frame[index,*],-10)
+		adc_array[i,*,*] = frame[index,*] - ishft(strip,10)
+		strip_array[i,*,*] = strip
+    	endfor
 
-	for j=0L, nFrames-1 do begin
-		for i=0, 3 do begin
-			max = max(data[j].data[i,3:60], maxind)
-			hit_strip[i,j] = maxind
-			hit_adc[i,j] = max
-			if maxind eq 0 then maxind++
-			if maxind eq 63 then maxind--
-			data_struct[j].adc[i,*] = data[j].data[i,maxind-1:maxind+1]
-			data_struct[j].strips[i,*] = [maxind-1,maxind,maxind+1]
-		endfor
+	data_struct.adc = adc_array
+	data_struct.strips = strip_array
+
+	asic = indgen(4)
+
+    ; Grab the common mode
+    data_struct.common_mode = frame[31 + 33*detector + 8*asic,*]
+
+	; Grab the channel mask
+    	data_struct.channel_mask = frame[27 + 33*detector + 8*asic,*]
+    	data_struct.channel_mask = ishft( data_struct.channel_mask, 16) + frame[26 + 33*detector + 8*asic,*]
+    	data_struct.channel_mask = ishft( data_struct.channel_mask, 16) + frame[25 + 33*detector + 8*asic,*]
+    	data_struct.channel_mask = ishft( data_struct.channel_mask, 16) + frame[24 + 33*detector + 8*asic,*]
+
+	;;;;;;
+	; Identify the "hit" (i.e. max ADC value) on p-side and n-side.  
+	; Save the ADC value, ASIC, and strip # for each side.
+	;;;;;;
+
+	print, "  Identifying hits."
+
+	; Identify max for each ASIC in each frame.
+	max0 = cmapply('max', data_struct.adc[0,*], [2])
+	max1 = cmapply('max', data_struct.adc[1,*], [2])
+	max2 = cmapply('max', data_struct.adc[2,*], [2])
+	max3 = cmapply('max', data_struct.adc[3,*], [2])
+	
+	; Identify which ASIC had the global max on each side.
+	; ASICs 0 and 2 automatically win any tie. (arbitrary)
+	ind_0 = where( max0 ge max1 and max0 gt 0 )
+	ind_1 = where( max1 gt max0 )
+	ind_2 = where( max2 ge max3 and max2 gt 0)
+	ind_3 = where( max3 gt max2 )
+	
+	; Identify the hit ASIC (if any!) for each frame.
+	; Hit ASIC values were initialized to -1.  After this step, any entries still at -1 did not get a hit.
+	data_struct[ind_0].hit_asic[0] = 0
+	data_struct[ind_1].hit_asic[0] = 1
+	data_struct[ind_2].hit_asic[1] = 2
+	data_struct[ind_3].hit_asic[1] = 3
+
+	; Fill in hit ADC values for p and n side.
+	data_struct[ind_0].hit_adc[0] = max0[ind_0]
+	data_struct[ind_1].hit_adc[0] = max1[ind_1]
+	data_struct[ind_2].hit_adc[1] = max2[ind_2]
+	data_struct[ind_3].hit_adc[1] = max3[ind_3]
+
+	; Hit strip /should/ always be the middle one in the 3-strip data, so grab the middle strip#s
+	data_struct[ind_0].hit_strip[0] = data_struct[ind_0].strips[0,1]
+	data_struct[ind_1].hit_strip[0] = data_struct[ind_1].strips[1,1]
+	data_struct[ind_2].hit_strip[1] = data_struct[ind_2].strips[2,1]
+	data_struct[ind_3].hit_strip[1] = data_struct[ind_3].strips[3,1]
+
+	; But account for the possibility that it's not!
+	for i_asic=0, 3 do begin
+
+		if i_asic gt 1 then n_p = 1 else n_p = 0	; 0 for n-side ASIC, 1 for p-side
+
+		; replace with the first strip# where needed.
+		glitch = where( data_struct.adc[i_asic,0] gt data_struct.adc[i_asic,1] and data_struct.hit_adc[n_p] eq i_asic )
+		if glitch[0] gt -1 then data_struct[glitch].hit_strip[n_p] = data_struct[glitch].strips[i_asic,0]  	
+
+		; replace with the last strip# where needed.
+		glitch = where( data_struct.adc[i_asic,2] gt data_struct.adc[i_asic,1] and data_struct.hit_adc[n_p] eq i_asic )
+		if glitch[0] gt -1 then data_struct[glitch].hit_strip[n_p] = data_struct[glitch].strips[i_asic,2]
+	
+		; If both the first and third strip are greater than the middle strip and are equal to each other, 
+		; the third strip is arbitrarily designated the hit strip.
+	
 	endfor
 	
-	; see which ASIC had the highest value on each side for each event.
-	temp = where( hit_adc[0,*] gt hit_adc[1,*])
-	if temp[0] ne -1 then data_struct[temp].hit_asic[0] = 0
-	if temp[0] ne -1 then data_struct[temp].hit_strip[0] = reform(hit_strip[0,temp])
-	if temp[0] ne -1 then data_struct[temp].hit_adc[0] = reform(hit_adc[0,temp])
-	temp = where( hit_adc[1,*] ge hit_adc[0,*])
-	if temp[0] ne -1 then data_struct[temp].hit_asic[0] = 1
-	if temp[0] ne -1 then data_struct[temp].hit_strip[0] = reform(hit_strip[1,temp])
-	if temp[0] ne -1 then data_struct[temp].hit_adc[0] = reform(hit_adc[1,temp])
-	temp = where( hit_adc[2,*] gt hit_adc[3,*])
-	if temp[0] ne -1 then data_struct[temp].hit_asic[1] = 2
-	if temp[0] ne -1 then data_struct[temp].hit_strip[1] = reform(hit_strip[2,temp])
-	if temp[0] ne -1 then data_struct[temp].hit_adc[1] = reform(hit_adc[2,temp])
-	temp = where( hit_adc[3,*] ge hit_adc[2,*])
-	if temp[0] ne -1 then data_struct[temp].hit_asic[1] = 3
-	if temp[0] ne -1 then data_struct[temp].hit_strip[1] = reform(hit_strip[3,temp])
-	if temp[0] ne -1 then data_struct[temp].hit_adc[1] = reform(hit_adc[3,temp])
-	
-	return, data_struct
+	; Compress data by getting rid of "zero" frames.  If a detector's trigger time
+	; is 0, then the frame is empty for that detector.  However, to not lose any
+	; data (even if it's bad), here frames are only thrown away if all data is 0
+	; except ASIC 3 common mode.  (ASIC 3 common mode should usually be nonzero.)
+
+	print, "  Deleting zero frames."
+
+	; Find the max value of all 33 words per detector in the frame.
+	; If max value is zero, then the frame is empty for this detector.
+	max_frame = cmapply('max', frame[ 23+33*detector:54+33*detector, *], [1])
+	data_struct_compressed = data_struct[ where( max_frame gt 0 ) ]
+
+	; Last step: check for obvious errors and flag these.
+
+	print, "  Checking data and flagging abnormalities."
+	; Check for events where *any* common mode > 1023
+	cm_max = cmapply('max', data_struct_compressed.common_mode, [1] )
+	data_struct_compressed[ where( cm_max gt 1023 ) ].error_flag = 1
+
+	if keyword_set(stop) then stop
+
+	print, "  Done!"
+
+	return, data_struct_compressed
 
 END
 
